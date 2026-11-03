@@ -1,23 +1,4 @@
 # REAL Video Enhancer
-![Visitors](https://api.visitorbadge.io/api/visitors?path=https%3A%2F%2Fgithub.com%2FTNTwise%2FREAL-Video-enhancer%2F&countColor=%23263759)
-[![pypresence](https://img.shields.io/badge/using-pypresence-00bb88.svg?style=for-the-badge&logo=discord&logoWidth=20)](https://github.com/qwertyquerty/pypresence)
-
-![license](https://img.shields.io/github/license/tntwise/real-video-enhancer)
-![Version](https://img.shields.io/badge/Version-2.4.1-blue)
-![downloads_total](https://img.shields.io/github/downloads/tntwise/REAL-Video-Enhancer/total.svg?label=downloads%40total)
-<a href="https://discord.gg/hwGHXga8ck">
-      <img src="https://img.shields.io/discord/1041502781808328704?label=Discord" alt="Discord Shield"/></a>
-<br/>
-<a href="https://flathub.org/apps/io.github.tntwise.REAL-Video-Enhancer">
-    <img src="https://dl.flathub.org/assets/badges/flathub-badge-en.svg" height="50px"/>
-  </a>
-<br/>
-<strong> Download on Steam! </strong>
-<br/>
-[![Download on Steam](https://img.shields.io/badge/Steam-000000?style=for-the-badge&logo=steam&logoColor=white)](https://store.steampowered.com/app/4087640/)
-
-
-
 <p align=center>
   <img src="https://github.com/TNTwise/REAL-Video-Enhancer/raw/2.0/icons/logo-v2.svg" width = "25%">
 </p>
@@ -37,12 +18,10 @@
   * [ROCm](#rocm-related-questions)
   * [NCNN](#ncnn-related-questions)
 * **[Cloning](#cloning)**
-* **[Building](#building)**
 * **[Colab Notebook](#colab-notebook)**
 * **[Credits](#credits)**
   * [People](#people) 
   * [Software](#software)
-* **[Support Me!](#support-me)**
 
 # Introduction
 
@@ -140,21 +119,6 @@ git clone --recurse-submodules https://github.com/TNTwise/REAL-Video-Enhancer
 # Stable
 git clone --recurse-submodules https://github.com/TNTwise/REAL-Video-Enhancer --branch 2.4.1
 ```
-# Building:
-
-<p>3 supported build methods: </p>
-<p> - pyinstaller (recommended for Win/Mac) <br/>
-    - cx_freeze (recommended for Linux) <br/>
-    - nuitka (experimental)
-</p>
-<p>supported python versions: </p>
-<p> - 3.10 3.11, 3.12 <br/>
-</p>
-
-```
-python3 build.py --build BUILD_OPTION --copy_backend
-```
-
 # Colab Notebook
  <a href="https://github.com/tntwise/REAL-Video-Enhancer-Colab">Colab Notebook</a>
 
@@ -190,12 +154,3 @@ python3 build.py --build BUILD_OPTION --copy_backend
 | Feather Icons | Open source icons library | https://github.com/feathericons/feather 
 | PySceneDetect | Transition detection library for python | https://github.com/Breakthrough/PySceneDetect/
 | Python Standalone Builds | Backend inference using portable python, helps when porting to different platforms. | https://github.com/indygreg/python-build-standalone |
-
-
-# Star History
-[![Star History Chart](https://api.star-history.com/svg?repos=tntwise/real-video-enhancer&type=Date)](https://star-history.com/#tntwise/real-video-enhancer&Date)
-
-
-# Support Me:
- * [Ko-Fi](https://ko-fi.com/tntwise)
- * [Steam](https://store.steampowered.com/app/4382640/REAL_Video_Enhancer_Donation/)
