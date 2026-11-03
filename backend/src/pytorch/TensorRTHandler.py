@@ -26,6 +26,7 @@ import sys
 import os
 from ..utils.Util import suppress_stdout_stderr, warnAndLog, log
 from ..version import __version__
+from ..notifications import emit
 import time
 with suppress_stdout_stderr():
     import torch
@@ -151,6 +152,7 @@ class TorchTensorRTHandler:
         """
         start_time = time.time()
         trt_engine_name += self.trt_path_appendix
+        emit("stage", stage="building_engine", engine=os.path.basename(trt_engine_name))
         TorchUtils.clear_cache()
         """Builds a TensorRT engine from the provided model."""
         print(

@@ -20,6 +20,8 @@ class UpscaleModelWrapper:
     def set_precision(self, precision: torch.dtype):
         self.__precision = precision
         self.__model.to(self.__device, dtype=precision)
+        from ..notifications import emit
+        emit("effective", model=self.__model_path, precision=str(precision))
 
     def get_model(self):
         return self.__model
@@ -89,7 +91,7 @@ class UpscaleModelWrapper:
                         self.__dummy_input_pre_channels = [1, 5,]
                         model = TemporalSPAN(upscale=self.__scale)
                         state_dict = torch.load(self.__model_path, map_location=self.__device)
-                        model.load_state_dict(state_dict=state_dict['params_ema'], strict=False)
+                        model.load_state_dict(state_dict=state_dict['params_ema'], strict=True)
                         self.__model = model.to(self.__device, dtype=self.__precision)
                         self.inference_helper = TemporalSPANInferenceHelper(model=self.__model, scale=self.__scale)
                         self.__inference_mode = 'tspan'

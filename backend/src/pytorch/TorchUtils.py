@@ -147,6 +147,8 @@ class TorchUtils:
     
         device = backendDetect.get_gpus_torch()[gpu_id]
         print("Using Device: " + str(device), file=sys.stderr)
+        from ..notifications import emit
+        emit("effective", device=str(torchdevice), gpu_id=gpu_id)
         return torchdevice
 
     @staticmethod

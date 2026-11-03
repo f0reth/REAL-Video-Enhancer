@@ -5,6 +5,7 @@ import os
 import subprocess
 import queue
 import time
+import shlex
 import cv2
 import numpy as np
 
@@ -84,6 +85,8 @@ class FFmpegRead(Buffer):
             f"{self.ffmpeg_path}",
             "-i",
             f"{self.inputFile}",
+            "-ss", str(self.start_time),
+            "-t", str(self.end_time - self.start_time),
         ]
 
         filter_string = f"crop={self.width}:{self.height}:{self.borderX}:{self.borderY},scale=w=iw*sar:h=ih" #+ ":in_range=limited:out_range=full,format=yuv420p" if self.yuv420pMOD == "yuv420p" else "" # fix dar != sar
@@ -143,7 +146,9 @@ class FFmpegRead(Buffer):
 
     def close(self):
         self.readProcess.stdout.close()
-        self.readProcess.terminate()
+        code = self.readProcess.wait()
+        if code:
+            raise RuntimeError(f"FFmpeg decoder failed: {code}")
 
 
 class FFmpegWrite(Buffer):
@@ -326,6 +331,8 @@ class FFmpegWrite(Buffer):
                     # Put timestamp hygiene flags *before* the input they apply to.
                     "-fflags",
                     "+genpts",
+                    "-ss", str(self.start_time),
+                    "-t", str(self.end_time - self.start_time),
                     "-i",
                     f"{self.inputFile}",
                     "-map",
@@ -352,7 +359,7 @@ class FFmpegWrite(Buffer):
 
             if self.custom_encoder is not None:
 
-                for i in self.custom_encoder.split():
+                for i in shlex.split(self.custom_encoder):
                     command.append(i)
             else:
                 if not self.audio_encoder.getPresetTag() == "copy_audio":
@@ -504,8 +511,8 @@ class FFmpegWrite(Buffer):
             print("Failed to read FFmpeg log file.")
             print(str(e))
 
-        time.sleep(1)
-        os._exit(1)
+        from .lifecycle import fail
+        fail("FFmpeg failed to render the video")
 
     def __del__(self):
         self.ffmpeg_log.close()

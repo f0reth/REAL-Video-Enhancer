@@ -2,6 +2,7 @@ from multiprocessing import shared_memory
 import sys
 import time
 import numpy as np
+from .notifications import emit
 
 if __name__ != "__main__":
     from .utils.Util import log, padFrame, subprocess_popen_without_terminal
@@ -91,19 +92,6 @@ class InformationWriteOut:
         self.isPaused = False
         self.stop = False
 
-    def realTimePrint(self, data):
-        data = str(data)
-        # Clear the last line
-        sys.stdout.write("\r" + " " * self.last_length)
-        sys.stdout.flush()
-
-        # Write the new line
-        sys.stdout.write("\r" + data)
-        sys.stdout.flush()
-
-        # Update the length of the last printed line
-        self.last_length = len(data)
-
     def get_is_paused(self):
         return self.isPaused
 
@@ -154,7 +142,7 @@ class InformationWriteOut:
                 if i == 0:
                     print("\n", file=sys.stderr)
                     i = 1
-                self.realTimePrint(message)
+                emit("progress", processed=self.framesRendered, total=self.totalOutputFrames, fps=fps, eta=eta)
                 if self.sharedMemoryID is not None and self.previewFrame is not None:
                     # Update the shared array
                     if self.border_detect:
@@ -176,3 +164,9 @@ class InformationWriteOut:
                             pass
                 self.isPaused = self.pausedManager.pause_manager()
             time.sleep(0.5) # setting this to a higher value will reduce the cpu usage, and increase fps
+
+    def close(self):
+        if hasattr(self, "shm"):
+            self.shm.close()
+        if hasattr(self.pausedManager, "pausedSharedMemory"):
+            self.pausedManager.pausedSharedMemory.close()

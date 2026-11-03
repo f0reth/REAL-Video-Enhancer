@@ -527,10 +527,26 @@ class HandleApplication:
                 "Interpolation factor must be 1 if no interpolation model is used.\nPlease use --interpolateFactor 1 for no interpolation!"
             )
         if self.args.backend == 'ncnn' and self.args.hdr_mode:
-            print("WARNING: HDR mode is not supported with ncnn backend, falling back to SDR",file=sys.stderr)
-            self.args.hdr_mode = False            
+            raise ValueError("NCNN does not support HDR")
 
 if __name__ == "__main__":
     
-    HandleApplication()
+    # Inspection commands retain their dedicated machine-readable output.
+    rendering = not any(arg in sys.argv for arg in ("--version", "--list_backends", "--print_video_info"))
+    if rendering:
+        from src.notifications import initialize, emit
+        from src.lifecycle import install, cleanup
+        initialize()
+        try:
+            install()
+            emit("stage", stage="loading")
+            HandleApplication()
+            cleanup()
+            emit("completed")
+        except BaseException as error:
+            emit("error", message=str(error))
+            cleanup()
+            raise
+    else:
+        HandleApplication()
     

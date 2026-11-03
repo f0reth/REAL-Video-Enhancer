@@ -9,6 +9,7 @@ import cv2
 
 from .FFmpegBuffers import FFmpegRead, FFmpegWrite, MPVOutput
 from .FFmpeg import InformationWriteOut
+from .notifications import emit
 from .utils.Encoders import EncoderSettings
 from .utils.SceneDetect import SceneDetect
 from .utils.Util import log, resize_image_bytes
@@ -144,15 +145,17 @@ class Render:
         else:
             cwd = os.getcwd()
             log("No Working Directory specified, using current directory: " + cwd)
-        videoInfo = OpenCVInfo(input_file=inputFile, start_time=start_time, end_time=end_time, ffmpeg_path=ffmpeg_path)
+        videoInfo = OpenCVInfo(input_file=inputFile, ffmpeg_path=ffmpeg_path)
         
         if not videoInfo.is_valid_video:
-            log("Input video is not valid!")
+            raise ValueError("Input video is not valid")
         
         if start_time is None:
             start_time = 0
         if end_time is None:
             end_time = videoInfo.get_duration_seconds()
+        if not math.isfinite(start_time) or not math.isfinite(end_time) or not 0 <= start_time < end_time <= videoInfo.get_duration_seconds() + 1 / videoInfo.get_fps():
+            raise ValueError("Invalid render interval")
 
         self.width, self.height = videoInfo.get_width_x_height()
         self.originalWidth = self.width
@@ -160,7 +163,7 @@ class Render:
         input_pix_fmt = videoInfo.get_pixel_format()
         self.borderX = 0
         self.borderY = 0  # set borders for cropping automatically to 0, will be overwritten if borders are detected
-        self.totalInputFrames = videoInfo.get_total_frames()
+        self.totalInputFrames = round((end_time - start_time) * videoInfo.get_fps())
         self.totalOutputFrames = int(
             self.totalInputFrames * self.ceilInterpolateFactor
         )
@@ -224,6 +227,9 @@ class Render:
         log(f"Total Output Frames: {self.totalOutputFrames}")
         log("Model Scale: " + str(self.modelScale))
         log("HDR Mode: " + str(hdr_mode))
+        emit("effective", backend=self.backend, width=self.width * self.upscaleTimes,
+             height=self.height * self.upscaleTimes, hdr=hdr_mode,
+             fps=self.fps if slomo_mode else self.fps * self.interpolateFactor)
 
         self.readBuffer = FFmpegRead(  # input width
             inputFile=inputFile,
@@ -294,6 +300,7 @@ class Render:
         )
         
 
+        emit("stage", stage="rendering")
         self.renderThread = Thread(target=self.render)
         self.ffmpegReadThread = Thread(target=self.readBuffer.read_frames_into_queue)
         self.ffmpegWriteThread = Thread(target=self.writeBuffer.write_out_frames)
@@ -310,6 +317,14 @@ class Render:
             MPVOut = MPVOutput(self.writeBuffer, width=self.width*self.upscaleTimes, height=self.height*self.upscaleTimes,fps=self.fps*self.interpolateFactor, outputFrameChunkSize=self.outputFrameChunkSize)
             MPVoutThread = Thread(target=MPVOut.write_out_frames)
             MPVoutThread.start()
+
+        self.renderThread.join()
+        self.ffmpegReadThread.join()
+        self.ffmpegWriteThread.join()
+        self.informationHandler.stopWriting()
+        self.sharedMemoryThread.join()
+        self.readBuffer.close()
+        self.informationHandler.close()
 
     def write_bytes_to_cv2_frame_debug(self, frame):
         # Convert the byte array to a numpy array
@@ -332,7 +347,11 @@ class Render:
         """
 
         while True:
-            if not self.informationHandler.get_is_paused():
+            paused = bool(self.informationHandler.pausedManager.pause_manager())
+            if paused != self.isPaused:
+                self.isPaused = paused
+                emit("paused" if paused else "resumed")
+            if not paused:
                 frame = self.readBuffer.get()
                 #self.write_bytes_to_cv2_frame_debug(frame)
                 if frame is None:
@@ -348,8 +367,8 @@ class Render:
                         img1=frame,
                         transition=sceneDetect,
                     )
-                    if not interpolated_frames:
-                        return
+                    if interpolated_frames is None:
+                        raise RuntimeError("Interpolation returned no frames")
                     
                     for interpolated_frame in interpolated_frames:
 
@@ -391,6 +410,8 @@ class Render:
                 frames_rendered += int(self.ceilInterpolateFactor)
             else:
                 sleep(1)
+        emit("progress", processed=frames_rendered, total=self.totalOutputFrames,
+             fps=round(frames_rendered / max(time() - self.informationHandler.startTime, 0.001), 2), eta="0:00:00")
         self.writeBuffer.writeQueue.put(None)
         """
         tracer.stop()

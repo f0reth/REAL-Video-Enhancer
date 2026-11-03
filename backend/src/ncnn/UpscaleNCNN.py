@@ -3781,17 +3781,10 @@ def get_broadcast_data(model: NcnnModel) -> tuple[int, int, int, int, str]:
 
 def getNCNNScale(modelPath: str = "") -> int:
     basename = os.path.basename(modelPath)
-    try:
-      modelParamPath = os.path.join(modelPath, basename + ".param")
-      model = NcnnModel.load_from_file(modelParamPath)
-      scale = get_broadcast_data(model)[0]
-    except Exception:
-        print("Failed to get scale from model, getting from filename")
-        for i in range(1, 20):
-            if f"x{i}" in basename or f"{i}x" in basename.lower():
-                scale = i
-                break
-    return scale
+    modelParamPath = os.path.join(modelPath, basename + ".param")
+    model = NcnnModel.load_from_file(modelParamPath)
+    return get_broadcast_data(model)[0]
+
 
 class UPSCALE:
     def __init__(self, gpuid: int = 0, tta_mode: bool = False, tilesize: int = 0, model: int = 0 ,num_threads: int = 1, model_str: str = "", scale: int = 0):
