@@ -2,7 +2,8 @@ import os
 import re
 
 from .Util import createDirectory, log, errorAndLog
-from .constants import CUSTOM_MODELS_PATH
+from .constants import CUSTOM_MODELS_PATH, MODELS_PATH, CWD
+from .ModelSpec import ModelSpec, ModelRegistry
 from .ui.QTcustom import RegularQTPopup
 
 """
@@ -633,23 +634,6 @@ ncnnSceneChangeModels = {
 
 
 
-# detect custom models
-createDirectory(CUSTOM_MODELS_PATH)
-customPytorchUpscaleModels = {}
-customNCNNUpscaleModels = {}
-for model in os.listdir(CUSTOM_MODELS_PATH):
-    
-    model_path = os.path.join(CUSTOM_MODELS_PATH, model)
-    if os.path.exists(model_path):
-        if not os.path.isfile(model_path):
-            customNCNNUpscaleModels[model] = (model, model, 4, "custom")
-    if model.endswith(".pth") or model.endswith(".safetensors"):
-        customPytorchUpscaleModels[model] = (model, model, 4, "custom")
-
-
-pytorchUpscaleModels = pytorchUpscaleModels | customPytorchUpscaleModels
-tensorrtUpscaleModels = tensorrtUpscaleModels | customPytorchUpscaleModels
-ncnnUpscaleModels = ncnnUpscaleModels | customNCNNUpscaleModels
 totalModels = (
     onnxInterpolateModels
     | onnxUpscaleModels
@@ -692,17 +676,16 @@ def getModels(backend:str):
             denoiseModels = tensorrtDenoiseModels
             decompressModels = tensorrtDecompressModels
             sceneChangeModels = pytorchSceneChangeModels
-        case "directml":
-            interpolateModels = onnxInterpolateModels
-            upscaleModels = onnxUpscaleModels
-            deblurModels = {}
         case _:
             RegularQTPopup(
                 "Failed to import any backends!, please try to reinstall the app!"
             )
             errorAndLog("Failed to import any backends!")
             return {}
-    return interpolateModels, upscaleModels, deblurModels, denoiseModels, decompressModels, sceneChangeModels
+    registry = ModelRegistry(os.path.join(CWD, "models.json"))
+    local = {m.name + " [" + m.id[:8] + "]": (m.path, None, m.scale, "custom")
+             for m in registry.models.values() if backend.split()[0] in m.backends}
+    return interpolateModels, upscaleModels | local, deblurModels, denoiseModels, decompressModels, sceneChangeModels
 
 def getModelDisplayName(model: str):
     try:
@@ -711,3 +694,23 @@ def getModelDisplayName(model: str):
         return onlyName.lower().replace(' ', '-')
     except:
         return (model[0] + model[1]) if len(model) >= 2 else ""
+
+
+def selected_specs(backend, selections):
+    tables = dict(zip(("interpolate", "upscale", "deblur", "denoise", "decompress", "scene"), getModels(backend)))
+    engine = backend.split()[0]
+    registry = ModelRegistry(os.path.join(CWD, "models.json"))
+    result = []
+    for kind, name in selections.items():
+        if not name:
+            continue
+        filename, download, scale, arch = tables[kind][name]
+        if arch == "custom":
+            result.append(next(m for m in registry.models.values() if m.path == filename))
+            continue
+        options = ()
+        if kind == "interpolate" and engine in ("pytorch", "tensorrt") and arch.startswith("rife"):
+            options = ("ensemble", "dynamic_flow") if engine == "pytorch" else ("ensemble",)
+        result.append(ModelSpec(f"{engine}:{kind}:{filename}", name, kind,
+                                os.path.join(MODELS_PATH, filename), scale, (engine,), options, download))
+    return tuple(result)

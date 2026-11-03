@@ -4,7 +4,7 @@ try:
 except ImportError:
     from constants import HAS_NETWORK_ON_STARTUP
 from dataclasses import dataclass
-from .ui.SettingsTab import Settings
+from .Settings import Settings
 
 @dataclass
 class TorchVersion:
