@@ -1,80 +1,62 @@
-import subprocess
 import os
-from threading import Thread
-import re
-from time import sleep
-from multiprocessing import shared_memory
-
-from PySide6 import QtGui
-from PySide6.QtGui import QPixmap, QPainter, QPainterPath, QColor, QFontMetrics
-from PySide6.QtCore import Qt, QSize, QUrl
+import subprocess
+from dataclasses import asdict
+from PySide6.QtCore import QProcess, QTimer, QThread, Signal, Qt
+from PySide6.QtGui import QImage, QPixmap, QFontMetrics
 from PySide6.QtWidgets import QMessageBox
-
-from .RenderQueue import RenderQueue
-
 from .AnimationHandler import AnimationHandler
-from .QTcustom import (
-    RegularQTPopup,
-    UpdateGUIThread,
-    show_layout_widgets,
-    hide_layout_widgets,
-)
-from ..constants import (
-    BACKEND_PATH,
-    PYTHON_EXECUTABLE_PATH,
-    MODELS_PATH,
-    CUSTOM_MODELS_PATH,
-    IMAGE_SHARED_MEMORY_ID,
-    PAUSED_STATE_SHARED_MEMORY_ID,
-    INPUT_TEXT_FILE,
-    FFMPEG_PATH,
-    CWD,
-    PLATFORM,
-)
-from ..Util import (
-    log,
-)
-from ..DownloadModels import DownloadModel
-from .SettingsTab import Settings
-from ..DiscordRPC import DiscordRPC
+from .QTcustom import RegularQTPopup, show_layout_widgets, hide_layout_widgets
+from ..constants import BACKEND_PATH, PYTHON_EXECUTABLE_PATH, MODELS_PATH, CUSTOM_MODELS_PATH, FFMPEG_PATH, CWD, PLATFORM
+from ..Util import log
 from ..ModelHandler import getModels
-from .RenderQueue import RenderOptions
+from ..ModelSpec import local_model, ModelRegistry
+from ..Jobs import JobState
+from ..Command import RuntimePaths
+from ..Execution import Executor
+from ..Output import FileIdentity
+from ..Protocol import Notifications
+
+
+class RegisterModel(QThread):
+    result = Signal(str)
+
+    def __init__(self, path, backend, scale, files, parent):
+        super().__init__(parent)
+        self.path, self.backend, self.scale = path, backend, scale
+        self.files = files
+
+    def run(self):
+        try:
+            model = local_model(self.path, self.backend, self.scale)
+            if [asdict(file) for file in model.files] != self.files:
+                raise ValueError("Model changed since inspection; register it again")
+            ModelRegistry(os.path.join(CWD, "models.json")).register(model)
+            self.result.emit("")
+        except Exception as error:
+            self.result.emit(str(error))
 
 
 class ProcessTab:
-    def __init__(self, parent, settings: Settings):
+    def __init__(self, parent, settings):
         self.parent = parent
-        self.renderTextOutputList = None
-        self.isOverwrite = False
-        self.outputVideoHeight = None
-        self.outputVideoWidth = None
-        self.currentFrame = 0
-        self.fps = 0
-        self.eta = 0
-        self.max_value = 0
-        self.isPreview = False
-        self.userKilled = False
-        self.currentRenderOptions = None
-        self.status = "Idle"
+        self.settings = settings
         self.animationHandler = AnimationHandler()
         self.tileUpAnimationHandler = AnimationHandler()
         self.tileDownAnimationHandler = AnimationHandler()
-        self.settings = settings
-        self.return_codes = []
-
-        self.qualityToCRF = {
-            "Low": "28",
-            "Medium": "23",
-            "High": "18",
-            "Very High": "15",
-        }
-        # encoder dict
-        # key is the name in RVE gui
-        # value is the encoder used
-
-        # get default backend
+        self.paths = RuntimePaths(PYTHON_EXECUTABLE_PATH, BACKEND_PATH, MODELS_PATH, CUSTOM_MODELS_PATH, CWD, FFMPEG_PATH)
+        self.executor = Executor(self.paths, parent.renderQueue.reservations, parent)
+        self.executor.changed.connect(self.updateJob)
+        self.executor.finished.connect(self.jobFinished)
+        self.executor.confirmation.connect(self.confirmReplacement)
+        self.executor.idle.connect(self.guiChangesOnRenderCompletion)
+        self.previewTimer = QTimer(parent)
+        self.previewTimer.setInterval(200)
+        self.previewTimer.timeout.connect(self.updatePreview)
+        self.previewTimer.start()
+        self.registration = None
+        self.registration_worker = None
         self.QConnect()
-        self.populateModels(self.parent.backendComboBox.currentText())
+        self.populateModels(parent.backendComboBox.currentText())
 
     def populateModels(self, backend) -> dict:
         """
@@ -173,494 +155,175 @@ class ProcessTab:
         self.parent.pauseRenderButton.clicked.connect(self.pauseRender)
         self.parent.killRenderButton.clicked.connect(self.killRenderProcess)
 
+    def run(self, renderQueue):
+        self.submit([job for job in renderQueue.queue if job.state == JobState.WAITING])
+
+    def submit(self, jobs):
+        if not jobs:
+            self.guiChangesOnRenderCompletion()
+            return
+        self.parent.disableProcessPage()
+        show_layout_widgets(self.parent.onRenderButtonsContiainer)
+        self.parent.startRenderButton.setVisible(False)
+        self.executor.submit(jobs)
+
+    def confirmReplacement(self, job):
+        try:
+            identity = job.pending_identity
+            answer = QMessageBox.question(self.parent, "Replace output?",
+                f"Replace this output for this job?\n{job.output.target}\nThe existing file is kept until the new output is validated.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer == QMessageBox.StandardButton.Yes:
+                self.executor.approve(job, identity)
+            else:
+                self.executor.cancel(job)
+        except OSError as error:
+            job.error = str(error)
+            self.executor.cancel(job)
+
     def killRenderProcess(self):
-        try:  # kills  render process if necessary
-            self.userKilled = True
-            self.renderProcess.terminate()
-        except AttributeError:
-            log("No render process!")
+        for job in self.executor.pending[:]:
+            self.executor.cancel(job)
+        self.executor.cancel()
+
+    def shutdown(self, callback):
+        self.killRenderProcess()
+        if self.registration:
+            process = self.registration
+            process.write(b"cancel\n")
+            QTimer.singleShot(2000, lambda: process.kill() if self.registration is process else None)
+        def drained():
+            if self.executor.current or self.executor.pending or self.registration or self.registration_worker:
+                QTimer.singleShot(100, drained)
+            else:
+                callback()
+        drained()
 
     def pauseRender(self):
-        shmbuf = self.pausedSharedMemory.buf
-        shmbuf[0] = 1  # 1 = True
-        hide_layout_widgets(self.parent.onRenderButtonsContiainer)
-        self.parent.startRenderButton.setVisible(True)
-        self.parent.startRenderButton.setEnabled(True)
+        self.executor.pause()
 
     def resumeRender(self):
-        shmbuf = self.pausedSharedMemory.buf
-        shmbuf[0] = 0  # 0 = False
-        show_layout_widgets(self.parent.onRenderButtonsContiainer)
-        self.parent.onRenderButtonsContiainer.setEnabled(True)
-        self.parent.startRenderButton.setVisible(False)
+        self.executor.resume()
 
-    def startGUIUpdate(self):
-        
-        self.workerThread = UpdateGUIThread(
-            parent=self,
-            imagePreviewSharedMemoryID=IMAGE_SHARED_MEMORY_ID,
-        )
-        self.workerThread.latestPreviewPixmap.connect(self.updateProcessTab)
-        self.workerThread.finished.connect(self.guiChangesOnRenderCompletion)
-        self.workerThread.finished.connect(self.workerThread.deleteLater)
-        self.workerThread.finished.connect(self.workerThread.quit)
-        self.workerThread.finished.connect(
-            self.workerThread.wait
-        )  # need quit and wait to allow process to exit safely
-        self.workerThread.start()
+    def updateJob(self, job):
+        event = job.progress
+        self.parent.STATUS.setText(f"Status: {job.state.value} {event.get('stage', '')}")
+        self.parent.FPS.setText(f"FPS: {event.get('fps', '')}")
+        self.parent.ETA.setText(f"ETA: {event.get('eta', '')}")
+        self.parent.progressBar.setRange(0, int(event.get('total', 0)))
+        self.parent.progressBar.setValue(int(event.get('processed', 0)))
+        self.parent.renderOutput.setPlainText("".join(job.logs[-200:]) + ("\n" + job.error if job.error else ""))
+        self.parent.renderQueue.refresh()
+        self.parent.pauseRenderButton.setEnabled(job.state == JobState.RUNNING)
+        if job.state == JobState.PAUSED:
+            self.parent.startRenderButton.setVisible(True)
+            self.parent.startRenderButton.setEnabled(True)
+            self.parent.startRenderButton.clicked.disconnect()
+            self.parent.startRenderButton.clicked.connect(self.resumeRender)
+        else:
+            self.parent.startRenderButton.setVisible(False)
+        if job.state == JobState.FINALIZE_FAILED:
+            answer = QMessageBox.question(self.parent, "Output publication failed", job.error + "\nRetry publication?",
+                                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if answer == QMessageBox.StandardButton.Yes:
+                QTimer.singleShot(0, self.executor.retry_commit)
+            else:
+                # Keep the validated temporary output and reservation for a later retry.
+                self.parent.startRenderButton.setVisible(True)
+                self.parent.startRenderButton.setEnabled(True)
+                self.parent.startRenderButton.clicked.disconnect()
+                self.parent.startRenderButton.clicked.connect(self.executor.retry_commit)
 
-    def splitListIntoStringWithNewLines(self, string_list: list[str]):
-        # Join the strings with newline characters
-        return "\n".join(string_list)
-        # Set the text to the QTextEdit
-
-    def questionToOverride(self):
-        reply = QMessageBox.question(
-            self.parent,
-            "",
-            "Output files in render queue already exist, do you want to overwrite?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,  # type: ignore
-        )
-        return reply == QMessageBox.Yes  # type: ignore
-
-    def askForOverwrite(self, outputPath):
-        if os.path.isfile(outputPath):
-            self.isOverwrite = self.questionToOverride()
-            if not self.isOverwrite:
-                self.onRenderCompletion()
-                self.guiChangesOnRenderCompletion()
-                return False
-        return True
-
-    def checkForOverwrite(self, renderQueue: RenderQueue):
-        for renderOptions in renderQueue.getQueue():
-            if not self.askForOverwrite(renderOptions.outputPath):
-                return False
-        return True
-
-    def run(
-        self,
-        renderQueue: RenderQueue,
-    ):
-        self.return_codes = [] # reset return codes
-        self.userKilled = False # reset userkilled
-        # gui changes
-        show_layout_widgets(self.parent.onRenderButtonsContiainer)
-        self.parent.startRenderButton.setVisible(False)
-        self.parent.startRenderButton.clicked.disconnect()
-        self.parent.startRenderButton.clicked.connect(self.resumeRender)
-
-        if not self.checkForOverwrite(renderQueue):
+    def updatePreview(self):
+        memory = self.executor.preview_memory
+        job = self.executor.current
+        if not memory or not job:
             return
+        options = job.options
+        width = options.video.width * options.processing.upscale_factor
+        height = options.video.height * options.processing.upscale_factor
+        channels = 6 if options.processing.hdr else 3
+        data = bytes(memory.buf[:width * height * channels])
+        if channels == 6:
+            import numpy as np
+            data = (np.frombuffer(data, dtype=np.uint16) >> 8).astype(np.uint8).tobytes()
+        image = QImage(data, width, height, width * 3, QImage.Format.Format_RGB888).copy()
+        self.parent.previewLabel.setPixmap(QPixmap.fromImage(image).scaled(
+            self.parent.previewLabel.size(), Qt.AspectRatioMode.KeepAspectRatio))
 
-        self.startDiscordRPC()
-        self.settings.readSettings()
-
-        self.startGUIUpdate()
-        writeThread = Thread(target=lambda: self.renderToPipeThread(renderQueue))
-        writeThread.start()
-
-    def startDiscordRPC(self):
-        if self.settings.settings["discord_rich_presence"] == "True":
+    def jobFinished(self, job):
+        self.parent.renderQueue.refresh()
+        if job.state == JobState.COMPLETED and not job.options.processing.benchmark:
+            self.parent.OutputFilesListWidget.addItem(job.options.outputPath)
+        if job.error:
+            log(job.error)
+            self.parent.renderOutput.append(job.error)
+        if job.state == JobState.COMPLETED and job.options.isPreview:
+            from PySide6.QtCore import QUrl
+            from PySide6.QtMultimedia import QMediaPlayer
+            self.previewPlayer = QMediaPlayer(self.parent)
+            self.previewPlayer.setSource(QUrl.fromLocalFile(job.options.outputPath))
+            self.previewPlayer.setVideoOutput(self.parent.VideoPreview)
+            self.parent.VideoPreview.show()
+            self.parent.previewLabel.hide()
+            self.parent.timeInVideoScrollBar.setRange(0, int((job.options.endTime - job.options.startTime) * 10))
             try:
-                self.discordRPC = DiscordRPC()
-                self.discordRPC.start_discordRPC()
-            except Exception:
+                self.parent.timeInVideoScrollBar.valueChanged.disconnect()
+            except RuntimeError:
                 pass
-
-    def createPausedSharedMemory(self):
-        try:
-            self.pausedSharedMemory = shared_memory.SharedMemory(
-                name=PAUSED_STATE_SHARED_MEMORY_ID, create=True, size=1
-            )
-        except FileExistsError:
-            log("FileExistsError! Using existing paused shared memory")
-            self.pausedSharedMemory = shared_memory.SharedMemory(
-                name=PAUSED_STATE_SHARED_MEMORY_ID
-            )
-
-    def renderToPipeThread(
-        self,
-        renderQueue: RenderQueue,
-    ):
-        self.createPausedSharedMemory()
-
-        for renderOptions in renderQueue.getQueue():
-            
-            self.isPreview = renderOptions.isPreview
-            self.currentRenderOptions = renderOptions
-
-            self.workerThread.setOutputVideoRes(
-                renderOptions.videoWidth * renderOptions.overrideUpscaleScale,
-                renderOptions.videoHeight * renderOptions.overrideUpscaleScale,
-            )
-            self.workerThread.createNewSharedMemory(channels=6 if renderOptions.hdrMode else 3)
-            self.max_value = renderOptions.videoFrameCount * renderOptions.interpolateTimes
-            command = self.build_command(renderOptions)
-            log(str(command))
-
-            kwargs = {
-                "stdout": subprocess.PIPE,
-                "stderr": subprocess.STDOUT,
-                "universal_newlines": True,
-                "text": True,                 # return str instead of bytes
-                "encoding": "utf-8",          # decode using utf-8
-                "errors": "replace",
-            }
-
-            if PLATFORM == "win32":
-                kwargs["startupinfo"] = subprocess.STARTUPINFO()
-                kwargs["startupinfo"].dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
-
-            self.renderProcess = subprocess.Popen(
-                command,
-                **kwargs,
-            )
-            textOutput = []
-            for line in iter(self.renderProcess.stdout.readline, b""):
-                if self.renderProcess.poll() is not None:
-                    break  # Exit the loop if the process has terminated
-
-                try:
-                    line = str(line.strip())
-                    if "it/s" in line:
-                        textOutput = textOutput[:-1]
-                    if "FPS" in line:
-                        textOutput = textOutput[
-                            :-1
-                        ]  # slice the list to only get the last updated data
-                        self.currentFrame = int(
-                            re.search(r"Current Frame: (\d+)", line).group(1)
-                        )
-                        self.fps = re.search(r"FPS: (\d+)", line).group(1)
-                        self.eta = re.search(r"ETA: (.+)", line).group(1)
-                        self.status = "Rendering"
-
-                    if "this may take a while" in line.lower():
-                        self.status = "Building Engine, this may take a while."
-
-
-                    if any(char.isalpha() for char in line):
-                        textOutput.append(line)
-                    # self.setRenderOutputContent(textOutput)
-                    self.renderTextOutputList = textOutput.copy()
-                except Exception as e:
-                    pass
-                if "Time to complete render" in line:
-                    break
-            self.return_codes.append(self.renderProcess.wait())
-            for line in textOutput:
-                if len(line) > 2:
-                    log(line)
-
-            self.parent.OutputFilesListWidget.addItem(
-                renderOptions.outputPath
-            )  # add the file to the list widget
-            self.workerThread.deleteSharedMemory()
-
-        try:
-            self.pausedSharedMemory.close()
-            self.pausedSharedMemory.unlink()
-        except Exception: # too lazy to patch why this errors maybe on exit
-            pass
-
-        renderQueue.clear()
-        self.onRenderCompletion()
+            self.parent.timeInVideoScrollBar.valueChanged.connect(lambda value: self.previewPlayer.setPosition(value * 100))
+            self.previewPlayer.play()
+            self.previewPlayer.pause()
 
     def guiChangesOnRenderCompletion(self):
-        if all(return_code == 0 or return_code == 3221225477 for return_code in self.return_codes) or self.userKilled: # 3221225477 comes up when using ncnn on windows for some reason, but no error in output itself.
-            log("All render processes completed successfully")
-        else:
-            log("Some render processes failed: Error code: " + str(self.return_codes))
-            RegularQTPopup("Rendering failed! Please check the logs tab!")
-        # Have to swap the visibility of these here otherwise crash for some reason
         hide_layout_widgets(self.parent.onRenderButtonsContiainer)
-        self.parent.startRenderButton.setEnabled(True)
-        self.parent.outputFileText.setEnabled(True)
-        self.parent.inputFileText.setEnabled(True)
-        self.parent.previewLabel.clear()
         self.parent.startRenderButton.clicked.disconnect()
         self.parent.startRenderButton.clicked.connect(self.parent.startRender)
-        self.parent.enableProcessPage()
         self.parent.startRenderButton.setVisible(True)
-        self.parent.FPS.setText("FPS: ")
-        self.parent.ETA.setText("ETA: ")
-        self.parent.STATUS.setText("Status: ")
-        self.parent.renderQueue.clear()
-        if self.currentRenderOptions.isPreview:
-            from PySide6.QtMultimedia import QMediaPlayer
+        self.parent.startRenderButton.setEnabled(True)
+        self.parent.enableProcessPage()
+
+    def registerModel(self, path, backend):
+        if self.registration or self.registration_worker:
+            RegularQTPopup("Model registration is already running")
+            return
+        process = QProcess(self.parent)
+        self.registration = process
+        parser = Notifications()
+        records = []
+        errors = []
+        def read():
             try:
-                def onScroll(preview:QMediaPlayer, value):
-                    preview.setPosition(value)
-
-                
-
-                player = QMediaPlayer()
-                player.setSource(QUrl.fromLocalFile(self.currentRenderOptions.outputPath))
-                player.setVideoOutput(self.parent.VideoPreview)
-                player.play()
-                player.pause()
-                player.setPosition(5)
-                self.parent.VideoPreview.show()
-                self.parent.VideoPreview.setVisible(True)
-                self.parent.previewLabel.setVisible(False)
-                self.parent.timeInVideoScrollBar.setRange(0, (((self.currentRenderOptions.endTime-self.currentRenderOptions.startTime))*10)-1) # convert to ms
-                self.parent.timeInVideoScrollBar.valueChanged.connect(lambda: onScroll(player, int(self.parent.timeInVideoScrollBar.value()*100)))
-
-            except Exception as e:
-                log(f"Error: {e}")
-
-
-    def onRenderCompletion(self):
-        self.eta = 0
-        self.fps = 0
-        try:
-            self.renderProcess.wait()
-        except Exception:
-            pass
-        # Have to swap the visibility of these here otherwise crash for some reason
-        if (
-            self.settings.settings["discord_rich_presence"] == "True"
-        ):  # only close if it exists
-            self.discordRPC.closeRPC()
-        try:
-            self.workerThread.stop()
-            self.workerThread.quit()
-            self.workerThread.wait()
-        except Exception:
-            pass  # pass just incase internet error caused a skip
-
-    def getRoundedPixmap(self, pixmap, corner_radius):
-        size = pixmap.size()
-        mask = QPixmap(size)
-        mask.fill(Qt.transparent)  # type: ignore
-
-        painter = QPainter(mask)
-        painter.setRenderHint(QPainter.Antialiasing)  # type: ignore
-        painter.setRenderHint(QPainter.SmoothPixmapTransform)  # type: ignore
-
-        path = QPainterPath()
-        path.addRoundedRect(
-            0, 0, size.width(), size.height(), corner_radius, corner_radius
-        )
-
-        painter.setClipPath(path)
-        painter.drawPixmap(0, 0, pixmap)
-        painter.end()
-
-        rounded_pixmap = QPixmap(size)
-        rounded_pixmap.fill(Qt.transparent)  # type: ignore
-
-        painter = QPainter(rounded_pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)  # type: ignore
-        painter.setRenderHint(QPainter.SmoothPixmapTransform)  # type: ignore
-        painter.drawPixmap(0, 0, mask)
-        painter.end()
-
-        return rounded_pixmap
-
-    def modelNameToFile(self):
-        pass
-
-    def updateProcessTab(self, qimage: QtGui.QImage):
-        """
-        Called by the worker QThread, and updates the GUI elements: Progressbar, Preview, FPS
-        """
-
-        if self.renderTextOutputList is not None:
-            self.parent.progressBar.setRange(
-                0,
-                # only set the range to multiply the frame count if the method is interpolate
-                self.max_value
-            )
-            # print(self.renderTextOutputList)
-            self.parent.renderOutput.setPlainText(
-                self.splitListIntoStringWithNewLines(self.renderTextOutputList)
-            )
-            scrollbar = self.parent.renderOutput.verticalScrollBar()
-            scrollbar.setValue(scrollbar.maximum())
-            self.parent.progressBar.setValue(self.currentFrame)
-            if self.fps != 0:
-                self.parent.FPS.setVisible(True)
-                self.parent.FPS.setText(f"FPS: {self.fps}")
-            else:
-                self.parent.FPS.setVisible(False)
-            if self.eta != 0:
-                self.parent.ETA.setVisible(True)
-                self.parent.ETA.setText(f"ETA: {self.eta}")
-            else:
-                self.parent.ETA.setVisible(False)
-            self.parent.STATUS.setText(f"Status: {self.status}")
-        if not qimage.isNull():
-            label_width = self.parent.previewLabel.width()
-            label_height = self.parent.previewLabel.height()
-
-            p = qimage.scaled(
-                label_width, label_height, Qt.AspectRatioMode.KeepAspectRatio
-            )  # type: ignore
-            pixmap = QtGui.QPixmap.fromImage(p)
-
-            roundedPixmap = self.getRoundedPixmap(pixmap, corner_radius=10)
-            self.parent.previewLabel.setPixmap(roundedPixmap)
-
-    def build_command(self, renderOptions: RenderOptions):
-        if (
-            renderOptions.backend == "pytorch (cuda)"
-            or renderOptions.backend == "pytorch (rocm)"
-            or renderOptions.backend == "pytorch (xpu)"
-            or renderOptions.backend == "pytorch (mps)"
-        ):
-            renderOptions.backend = (
-                "pytorch"  # pytorch is the same for both cuda and rocm
-            )
-
-        command = [
-            f"{PYTHON_EXECUTABLE_PATH}",
-            "-W",
-            "ignore",
-            os.path.join(BACKEND_PATH, "rve-backend.py"),
-            "-i",
-            renderOptions.inputFile,
-            "-o",
-            renderOptions.outputPath,
-            "-b",
-            f"{renderOptions.backend}",
-            "--precision",
-            f"{self.settings.settings['precision']}",
-            "--custom_encoder",
-            f" {renderOptions.encoderCommand} ",
-            "--tensorrt_opt_profile",
-            f"{self.settings.settings['tensorrt_optimization_level']}",
-            "--pause_shared_memory_id",
-            f"{PAUSED_STATE_SHARED_MEMORY_ID}",
-            "--ncnn_gpu_id",
-            f"{self.settings.settings['ncnn_gpu_id']}",
-            "--pytorch_gpu_id",
-            f"{self.settings.settings['pytorch_gpu_id']}",
-            "--cwd",
-            f"{CWD}",
-            "--ffmpeg_path",
-            f"{FFMPEG_PATH}",
-
-        ]
-
-        if renderOptions.upscaleModelFile:
-            modelPath = os.path.join(MODELS_PATH, renderOptions.upscaleModelFile)
-            if renderOptions.upscaleModelArch == "custom":
-                modelPath = os.path.join(
-                    CUSTOM_MODELS_PATH, renderOptions.upscaleModelFile
-                )
-            command += [
-                "--upscale_model",
-                modelPath,
-            ]
-            command += ["--override_upscale_scale", f"{renderOptions.overrideUpscaleScale}"]
-            
-        if renderOptions.tilingEnabled:
-            command += [
-                "--tilesize",
-                f"{renderOptions.tilesize}",
-            ]
-            
-
-        if renderOptions.interpolateModelFile:
-            command += [
-                "--interpolate_model",
-                os.path.join(
-                    MODELS_PATH,
-                    renderOptions.interpolateModelFile,
-                ),
-                "--interpolate_factor",
-                f"{renderOptions.interpolateTimes}",
-            ]
-            if renderOptions.sloMoMode:
-                command += [
-                    "--slomo_mode",
-                ]
-            if renderOptions.dyanmicScaleOpticalFlow:
-                command += [
-                    "--dynamic_scaled_optical_flow",
-                ]
-            if renderOptions.ensemble:
-                command += [
-                    "--ensemble",
-                ]
-        
-        if renderOptions.deblurModelFile:
-            command += [
-                "--extra_restoration_models",
-                os.path.join(
-                    MODELS_PATH,
-                    renderOptions.deblurModelFile,
-                ),
-            ]
-        if renderOptions.denoiseModelFile:
-            command += [
-                "--extra_restoration_models",
-                os.path.join(
-                    MODELS_PATH,
-                    renderOptions.denoiseModelFile,
-                ),
-            ]
-        if renderOptions.decompressModelFile:
-            command += [
-                "--extra_restoration_models",
-                os.path.join(
-                    MODELS_PATH,
-                    renderOptions.decompressModelFile,
-                ),
-            ]
-
-        if self.settings.settings["auto_border_cropping"] == "True":
-            command += [
-                "--border_detect",
-            ]
-
-        if self.settings.settings["dynamic_tensorrt_engine"] == "True":
-            command += [
-                "--tensorrt_dynamic_shapes",
-            ]
-
-        if self.settings.settings["preview_enabled"] == "True":
-            command += [
-                "--preview_shared_memory_id",
-                f"{IMAGE_SHARED_MEMORY_ID}",
-            ]
-
-        if self.settings.settings["scene_change_detection_enabled"] == "False":
-            command += ["--scene_detect_method", "none"]
-        else:
-            command += [
-                "--scene_detect_method",
-                self.settings.settings["scene_change_detection_method"],
-                "--scene_detect_threshold",
-                self.settings.settings["scene_change_detection_threshold"],
-            ]
-            if renderOptions.sceneChangeModelFile:
-                command += [
-                    "--scene_detect_model",
-                    os.path.join(
-                        MODELS_PATH,
-                        renderOptions.sceneChangeModelFile,
-                    ),
-                ]
-
-        if renderOptions.benchmarkMode:
-            command += ["--benchmark"]
-
-        if self.settings.settings["uhd_mode"] == "True":
-            if renderOptions.videoWidth > 1920 or renderOptions.videoHeight > 1080:
-                command += ["--UHD_mode"]
-                log("UHD mode enabled")
-
-        if self.isOverwrite:
-            command += ["--overwrite"]
-
-        if renderOptions.hdrMode:
-            command += ["--hdr_mode"]
-
-
-
-        return command
+                records.extend(parser.feed(bytes(process.readAllStandardOutput())))
+            except Exception as error:
+                errors.append(str(error))
+        process.readyReadStandardOutput.connect(read)
+        process.readyReadStandardError.connect(lambda: errors.append(bytes(process.readAllStandardError()).decode("utf-8", errors="replace")))
+        def finished(code, status):
+            read()
+            try:
+                parser.feed(b"", final=True)
+                if code or status != QProcess.ExitStatus.NormalExit:
+                    raise ValueError("Model inspection failed: " + "".join(errors)[-3000:])
+                result = next(record for record in records if record["event"] == "model")
+                worker = RegisterModel(path, backend, result["scale"], result["files"], self.parent)
+                self.registration_worker = worker
+                worker.result.connect(lambda error: RegularQTPopup(error) if error else self.populateModels(self.parent.backendComboBox.currentText()))
+                def registered():
+                    self.registration_worker = None
+                    worker.deleteLater()
+                worker.finished.connect(registered)
+                worker.start()
+            except Exception as error:
+                RegularQTPopup(str(error))
+            self.registration = None
+            process.deleteLater()
+        process.finished.connect(finished)
+        def start_error(error):
+            if error == QProcess.ProcessError.FailedToStart:
+                RegularQTPopup(process.errorString())
+                self.registration = None
+                process.deleteLater()
+        process.errorOccurred.connect(start_error)
+        process.start(PYTHON_EXECUTABLE_PATH, [os.path.join(BACKEND_PATH, "model-probe.py"), backend, path])

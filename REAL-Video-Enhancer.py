@@ -1,3 +1,5 @@
+from dataclasses import replace, fields
+import uuid
 from src.constants import CUSTOM_MODELS_PATH, IS_STEAM, MODELS_PATH, CWD,  IS_INSTALLED, TEMP_DOWNLOAD_PATH, USE_LOCAL_BACKEND, PLATFORM
 import os
 try: 
@@ -42,11 +44,13 @@ createDirectory(os.path.join(CWD, "python"))
 createDirectory(os.path.join(CWD, "bin"))
 
 
-from src.DownloadModels import DownloadModel
+from src.Jobs import ExecutionSettings, JobState, VideoInfo, ProcessingSettings
+from src.ModelHandler import selected_specs
 from src.DownloadDeps import Dependency, Python, DownloadDependencies
 from src.ui.ProcessTab import ProcessTab
 from src.ui.DownloadTab import DownloadTab
-from src.ui.SettingsTab import SettingsTab, Settings
+from src.ui.SettingsTab import SettingsTab
+from src.Settings import Settings
 from src.ui.HomeTab import HomeTab
 from src.Backendhandler import BackendHandler
 from src.ModelHandler import totalModels
@@ -302,22 +306,18 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # connect getting default output file
 
     def renderPreview(self):
-        self.renderQueue.clear()
-        renderOptions = self.getCurrentRenderOptions()
-        renderOptions.outputPath = os.path.join(TEMP_DOWNLOAD_PATH, f"{os.path.basename(renderOptions.inputFile)}_preview.mkv")
-        renderOptions.startTime = self.startTimeSpinBox.value()
-        FileHandler().removeFile(renderOptions.outputPath)
-        renderOptions.endTime = self.endTimeSpinBox.value()
-        if renderOptions.endTime <= renderOptions.startTime:
-            NotificationOverlay("End time must be greater than start time!", self, timeout=1500)
+        options = self.getCurrentRenderOptions()
+        if options == 1:
             return
-
-
-        renderOptions.isPreview = True
-        if renderOptions:
-            self.renderQueue.add(renderOptions)
-            self.startRender(self.renderQueue)
-
+        os.makedirs(TEMP_DOWNLOAD_PATH, exist_ok=True)
+        options = replace(options,
+            outputPath=os.path.join(TEMP_DOWNLOAD_PATH, f"preview-{uuid.uuid4().hex}.mkv"),
+            startTime=self.startTimeSpinBox.value(), endTime=self.endTimeSpinBox.value(), isPreview=True)
+        try:
+            job = self.renderQueue.create_job(options)
+            self.processTab.submit([job])
+        except (ValueError, OSError) as error:
+            RegularQTPopup(str(error))
 
     def setButtonsUnchecked(self, buttonToIgnore):
         buttons = [
@@ -369,12 +369,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 f"FPS: {round(self.videoFps, 0)} -> {round(self.videoFps * interpolateTimes, 0) if not self.sloMoModeCheckBox.isChecked() else round(self.videoFps, 0)}\n"
                 + f"Resolution: {self.videoWidth}x{self.videoHeight} -> {self.videoWidth * scale}x{self.videoHeight * scale}\n"
                 + f"Frame Count: {self.videoFrameCount} -> {int(round(self.videoFrameCount * interpolateTimes, 0))}\n"
-                + f"Encoder: {self.videoEncoder} -> {self.settings.settings['encoder']}\n"
-                + f"Container: {self.videoContainer} -> {self.settings.settings['video_container']}\n"
+                + f"Encoder: {self.videoEncoder} -> {self.settings.values.encoder}\n"
+                + f"Container: {self.videoContainer} -> {self.settings.values.video_container}\n"
                 + f"Color Space: {self.colorSpace} -> {self.colorSpace}\n"
                 + f"Pixel Format: {self.settingsTab.in_pix_fmt} -> {self.settingsTab.out_pixel_fmt}\n"
-                + f"HDR: {self.videoHDR} -> {self.videoHDR if self.settings.settings['auto_hdr_mode'] == 'True' else 'False'}\n"
-                + f"Bit Depth: {self.videoBitDepth} bit -> {new_bitrate if self.settings.settings['auto_hdr_mode'] == 'True' else 8} bit\n"
+                + f"HDR: {self.videoHDR} -> {self.videoHDR if self.settings.values.auto_hdr_mode else 'False'}\n"
+                + f"Bit Depth: {self.videoBitDepth} bit -> {new_bitrate if self.settings.values.auto_hdr_mode else 8} bit\n"
             )
             
             self.inputVideoInfoTextEdit.setFontPointSize(10)
@@ -415,7 +415,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             
             interpolateTimes = self.getInterpolationMultiplier(interpolateModelName) if not self.sloMoModeCheckBox.isChecked() else 1
             scale = self.getUpscaleModelScale(upscaleModelName)
-            container = self.settings.settings["video_container"]
+            container = self.settings.values.video_container
 
             file_name = os.path.splitext(os.path.basename(inputFile))[0]
             base_file_name = (
@@ -462,7 +462,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.upscaleContainer.setVisible(isUpscale or isDeblur or isDenoise or isDecompress)
         self.generalUpscaleContainer.setVisible(isUpscale)
         self.settings.readSettings()
-        self.setDefaultOutputFile(self.inputFileText.text(), str(os.path.dirname(self.inputFileText.text())) if (self.settings.settings["use_same_output_folder_as_input_file_enabled"] == "True" and self.isVideoLoaded and len(self.batchVideos) == 0 and os.path.exists(os.path.dirname(self.inputFileText.text()))) else self.settings.settings["output_folder_location"])
+        self.setDefaultOutputFile(self.inputFileText.text(), str(os.path.dirname(self.inputFileText.text())) if (self.settings.values.use_same_output_folder_as_input_file_enabled and self.isVideoLoaded and len(self.batchVideos) == 0 and os.path.exists(os.path.dirname(self.inputFileText.text()))) else self.settings.values.output_folder_location)
         self.updateVideoGUIText()
         self.startTimeSpinBox.setMaximum(self.videoLength)
         self.endTimeSpinBox.setMaximum(self.videoLength)
@@ -483,12 +483,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         scene_detect_method = self.scene_change_detection_method.currentText()
         input_file = self.inputFileText.text() if input_file is None else input_file
         output_path = self.outputFileText.text() if output_path is None else output_path
-        interpolateModelFile = None
-        upscaleModelFile = None
-        deblurModelFile = None
-        denoiseModelFile = None
-        decompressModelFile = None
-        scene_detect_model_file = None
         if not self.interpolateCheckBox.isChecked():
             interpolate = None
         if not self.upscaleCheckBox.isChecked():
@@ -508,136 +502,43 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             return 1
 
         backend = self.backendComboBox.currentText()
-        upscaleModelArch = "custom"
         interpolateModels, upscaleModels, deblurModels, denoiseModels, decompressModels, sceneChangeModels = getModels(backend)
 
-        if interpolate:
-            interpolateDownloadFile = interpolateModels[interpolate][1]
-            interpolateModelFile = interpolateModels[interpolate][0]
-
-            dm = DownloadModel(
-                modelFile=interpolateModelFile,
-                downloadModelFile=interpolateDownloadFile,
-            )
-            if "sudo" in scene_detect_method:
-                scene_detect_model_file = sceneChangeModels[scene_detect_method][0]
-                scene_detect_download_file = sceneChangeModels[scene_detect_method][1]
-                dm_scene = DownloadModel(
-                    modelFile=scene_detect_model_file,
-                    downloadModelFile=scene_detect_download_file,
-                )
-                if not dm_scene.downloadModel():
-                    NotificationOverlay(
-                        "Unable to download scene detection model, please check your network and try again.",
-                        self,
-                        timeout=1500,
-                    )
-                    return 1
-            if not dm.downloadModel():
-                NotificationOverlay(
-                    "Unable to download model, please check your network and try again.",
-                    self,
-                    timeout=1500,
-                )
-                return 1
-        upscaleTimes = 1
-        modelScale = 1
-        if upscale:
-            upscaleModelFile = upscaleModels[upscale][0]
-            upscaleDownloadFile = upscaleModels[upscale][1]
-            modelScale = upscaleModels[upscale][2]
-            upscaleTimes = int(self.upscaleScaleSpinBox.value())
-            upscaleModelArch = upscaleModels[upscale][3]
-            if upscaleModelArch != "custom":
-                dm = DownloadModel(
-                    modelFile=upscaleModelFile,
-                    downloadModelFile=upscaleDownloadFile,
-                )
-                if not dm.downloadModel():
-                    NotificationOverlay(
-                        "Unable to add to render queue.\nModel can't be downloaded.\nPlease check your network and try again.",
-                        self,
-                        timeout=2500,
-                    )
-                    return 1
-        if deblur:
-            deblurModelFile = deblurModels[deblur][0]
-            deblurDownloadFile = deblurModels[deblur][1]
-            dm = DownloadModel(
-                modelFile=deblurModelFile,
-                downloadModelFile=deblurDownloadFile,
-            )
-            if not dm.downloadModel():
-                NotificationOverlay(
-                    "Unable to add to render queue.\nModel can't be downloaded.\nPlease check your network and try again.",
-                    self,
-                    timeout=2500,
-                )
-                return 1
-        
-        if denoise:
-            denoiseModelFile = denoiseModels[denoise][0]
-            denoiseDownloadFile = denoiseModels[denoise][1]
-            dm = DownloadModel(
-                modelFile=denoiseModelFile,
-                downloadModelFile=denoiseDownloadFile,
-            )
-            if not dm.downloadModel():
-                NotificationOverlay(
-                    "Unable to add to render queue.\nModel can't be downloaded.\nPlease check your network and try again.",
-                    self,
-                    timeout=2500,
-                )
-                return 1
-        if decompress:
-            decompressModelFile = decompressModels[decompress][0]
-            decompressDownloadFile = decompressModels[decompress][1]
-            dm = DownloadModel(
-                modelFile=decompressModelFile,
-                downloadModelFile=decompressDownloadFile,
-            )
-            if not dm.downloadModel():
-                NotificationOverlay(
-                    "Unable to add to render queue.\nModel can't be downloaded.\nPlease check your network and try again.",
-                    self,
-                    timeout=2500,
-                )
-                return 1
+        selections = {"interpolate": interpolate, "upscale": upscale, "deblur": deblur,
+                      "denoise": denoise, "decompress": decompress}
+        if interpolate and self.settings.values.scene_change_detection_enabled and scene_detect_method in sceneChangeModels:
+            selections["scene"] = scene_detect_method
+        models = selected_specs(backend, selections)
+        by_kind = {model.kind: model for model in models}
+        upscaleTimes = int(self.upscaleScaleSpinBox.value()) if upscale else 1
         hdrmode = False
-        """if "gmfss" in interpolateDownloadFile.lower():
-            log("GMFSS model detected, enabling rgb48 proc to have correct colors.")
-            hdrmode = True"""
-        if self.settings.settings["auto_hdr_mode"] == "True" and (self.videoHDR or self.videoBitDepth > 8):
+        if self.settings.values.auto_hdr_mode and (self.videoHDR or self.videoBitDepth > 8):
             hdrmode = True
         return RenderOptions(
             inputFile=input_file,
             outputPath=output_path,
-            videoWidth=self.videoWidth,
-            videoHeight=self.videoHeight,
-            videoFps=self.videoFps,
-            tilingEnabled=self.tilingCheckBox.isChecked(),
-            tilesize=self.tileSizeComboBox.currentText(),
-            videoFrameCount=self.videoFrameCount,
+            video=VideoInfo(self.videoWidth, self.videoHeight, self.videoFps, self.videoFrameCount),
+            processing=ProcessingSettings(
+                tiling_enabled=self.tilingCheckBox.isChecked(),
+                tile_size=int(self.tileSizeComboBox.currentText()),
+                interpolate_factor=self.getInterpolationMultiplier(self.interpolateModelComboBox.currentText()) if interpolate else 1,
+                upscale_factor=upscaleTimes,
+                benchmark=self.benchmarkModeCheckBox.isChecked(),
+                slow_motion=self.sloMoModeCheckBox.isChecked() if interpolate else False,
+                dynamic_flow=self.dynamicScaledOpticalFlowCheckBox.isChecked() if interpolate else False,
+                ensemble=self.ensembleCheckBox.isChecked() if interpolate else False,
+                hdr=hdrmode),
             backend=self.backendComboBox.currentText(),
-            interpolateTimes=self.getInterpolationMultiplier(
-                self.interpolateModelComboBox.currentText()
-            ),
-            benchmarkMode=self.benchmarkModeCheckBox.isChecked(),
-            sloMoMode=self.sloMoModeCheckBox.isChecked(),
-            dyanmicScaleOpticalFlow=self.dynamicScaledOpticalFlowCheckBox.isChecked(),
-            ensemble=self.ensembleCheckBox.isChecked(),
-            modelScale=modelScale,
-            upscaleModelArch=upscaleModelArch,
-            upscaleModelFile=upscaleModelFile,
-            deblurModelFile=deblurModelFile,
-            denoiseModelFile=denoiseModelFile,
-            decompressModelFile=decompressModelFile,
-            interpolateModelFile=interpolateModelFile,
-            sceneChangeModelFile=scene_detect_model_file,
-            hdrMode=hdrmode,
-            overrideUpscaleScale=upscaleTimes,
-            encoderCommand=self.EncoderCommand.text(),
+            encoding=self.currentEncoding,
+            execution=ExecutionSettings(**{f.name: getattr(self.settings.values, f.name) for f in fields(ExecutionSettings)}),
+            models=models,
         )
+
+    def queueOptions(self, options):
+        try:
+            self.renderQueue.add(options)
+        except (ValueError, OSError) as error:
+            RegularQTPopup(str(error))
 
     def addToRenderQueue(self):
         self.settings.readSettings()
@@ -681,7 +582,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 if renderOptions == 1:
                     return
                 # alert user that item has been added to queue
-                self.renderQueue.add(renderOptions)
+                self.queueOptions(renderOptions)
                 
 
             # clear batch file list
@@ -701,7 +602,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         NotificationOverlay(
             f"{self.inputFileText.text()} Added to queue!", self, timeout=1500
         )
-        self.renderQueue.add(renderOptions)
+        self.queueOptions(renderOptions)
 
     def startRender(self, renderQueue=None):
         if not renderQueue:
@@ -828,7 +729,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         inputFile, _ = QFileDialog.getOpenFileName(
             parent=self,
             caption="Select File",
-            dir=self.settings.settings["last_input_folder_location"] if os.path.exists(self.settings.settings["last_input_folder_location"]) else self.homeDir,
+            dir=self.settings.values.last_input_folder_location if os.path.exists(self.settings.values.last_input_folder_location) else self.homeDir,
             filter=fileFilter,
         )
         self.loadVideo(inputFile)
@@ -843,89 +744,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.loadVideo(inputFolder, multi_file=True)
 
     def importCustomModel(self, format: str):
-        """
-        *args
-        format: str
-            The format of the model to import (pytorch, ncnn)
-        """
-
         if format == "pytorch":
-            fileFilter = "PyTorch Model (*.pth *.safetensors)"
+            path, _ = QFileDialog.getOpenFileName(self, "Select PyTorch model", self.homeDir, "Models (*.pth *.safetensors)")
+        else:
+            path = QFileDialog.getExistingDirectory(self, "Select NCNN model directory (matching .param and .bin)", self.homeDir)
+        if path:
+            self.processTab.registerModel(path, format)
 
-            modelFile, _ = QFileDialog.getOpenFileName(
-                parent=self,
-                caption="Select PyTorch Model",
-                dir=self.homeDir,
-                filter=fileFilter,
-            )
-               
-            if modelFile == "":
-                RegularQTPopup("Please select a model file!")
-                return
-            
-            outputModelPath = os.path.join(
-                CUSTOM_MODELS_PATH, os.path.basename(modelFile)
-            )
-            FileHandler.copyFile(modelFile, CUSTOM_MODELS_PATH)
-
-            if os.path.isfile(outputModelPath):
-                NotificationOverlay(
-                    "Model imported successfully!\nPlease restart the app for the changes to take effect.",
-                    self,
-                    timeout=1500,
-                )
-            else:
-                NotificationOverlay(
-                    "Failed to import model!\nPlease try again.", self, timeout=1500
-                )
-
-        elif format == "ncnn":
-            binFileFilter = "NCNN Bin (*.bin)"
-            modelBinFile, _ = QFileDialog.getOpenFileName(
-                parent=self,
-                caption="Select NCNN Bin",
-                dir=self.homeDir,
-                filter=binFileFilter,
-            )
-            if modelBinFile == "":
-                RegularQTPopup("Please select a bin file!")
-                return
-            modelParamFile, _ = QFileDialog.getOpenFileName(
-                parent=self,
-                caption="Select NCNN Param",
-                dir=os.path.dirname(modelBinFile),
-                filter=os.path.basename(modelBinFile).replace(".bin", ".param"),
-            )
-            if modelParamFile == "":
-                RegularQTPopup("Please select a param file!")
-                return
-            outputModelFolder = os.path.join(
-                CUSTOM_MODELS_PATH,
-                os.path.basename(modelBinFile).replace(".bin", ""),
-            )
-            FileHandler.createDirectory(outputModelFolder)
-            outputBinPath = os.path.join(
-                outputModelFolder, os.path.basename(modelBinFile)
-            )
-            FileHandler.copyFile(modelBinFile, outputModelFolder)
-            outputParamPath = os.path.join(
-                outputModelFolder, os.path.basename(modelParamFile)
-            )
-            FileHandler.copyFile(modelParamFile, outputModelFolder)
-
-            if os.path.isfile(outputBinPath) and os.path.isfile(outputParamPath):
-                NotificationOverlay(
-                    "Model imported successfully!\nPlease restart the app for the changes to take effect.",
-                    self,
-                    timeout=1500,
-                )
-
-            else:
-                NotificationOverlay(
-                    "Failed to import model!\nPlease try again.", self, timeout=1500
-                )
-
-       
     # output file button
     def openOutputFolder(self):
         """
@@ -946,6 +771,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     def closeEvent(self, event):
 
+        if getattr(self, "_closing", False):
+            event.accept()
+            return
         reply = QMessageBox.question(
             self,
             "",
@@ -954,10 +782,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             QMessageBox.StandardButton.No,  # type: ignore
         )
         if reply == QMessageBox.Yes:  # type: ignore
-            FileHandler.removeFolder(TEMP_DOWNLOAD_PATH)
             if hasattr(self, "processTab"):
-                self.processTab.killRenderProcess()
-            event.accept()
+                event.ignore()
+                def close_when_drained():
+                    self._closing = True
+                    self.close()
+                self.processTab.shutdown(close_when_drained)
+            else:
+                event.accept()
         else:
             event.ignore()
 
